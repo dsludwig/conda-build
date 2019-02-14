@@ -17,6 +17,7 @@ import tarfile
 from tempfile import gettempdir
 import time
 from uuid import uuid4
+import sqlite3
 
 # Lots of conda internals here.  Should refactor to use exports.
 from conda.common.compat import ensure_binary
@@ -439,6 +440,25 @@ def _gather_channeldata_reference_packages(all_repodata_packages):
         except KeyError as e:
             log.warn("group {} failed to gather channeldata.  Error was {}.  Skipping this one...".format(group, e))
     return reference_packages
+
+
+def _gather_filelist_reference_packages(repodata_packages):
+    groups = groupby('name', repodata_packages)
+    reference_packages = []
+    for group in groups.values():
+        try:
+            version_groups = groupby('version', group)
+            latest_version = sorted(version_groups, key=VersionOrder)[-1]
+            build_number_groups = groupby('build_number', version_groups[latest_version])
+            latest_build_number = sorted(build_number_groups)[-1]
+            ref_pkg = sorted(build_number_groups[latest_build_number],
+                                key=lambda x: x['build'])[-1]
+            ref_pkg["reference_package"] = "%s/%s" % (ref_pkg["subdir"], ref_pkg["fn"])
+            reference_packages.append(ref_pkg)
+        except KeyError as e:
+            log.warn("group {} failed to gather filelist.  Error was {}.  Skipping this one...".format(group, e))
+    return reference_packages
+
 
 
 def _collect_namemap(subdirs, patched_repodata, patch_instructions):
@@ -907,7 +927,13 @@ class ChannelIndex(object):
                     if changed:
                         self._write_subdir_index_html(subdir, repodata2[subdir])
 
-                # Step 7. Create and write channeldata.
+                # Step 7. Create and write file index
+                for subdir in subdirs:
+                    repodata_packages = repodata2[subdir]["packages"]
+                    reference_packages = _gather_filelist_reference_packages(repodata_packages)
+                    self._write_file_index(subdir, reference_packages)
+
+                # Step 8. Create and write channeldata.
                 all_repodata_packages = tuple(concat(repodata["packages"] for repodata in repodata2.values()))
                 reference_packages = _gather_channeldata_reference_packages(all_repodata_packages)
                 channel_data, package_mtimes = self._build_channeldata(subdirs, reference_packages)
@@ -1073,7 +1099,7 @@ class ChannelIndex(object):
         tar_path = join(subdir_path, fn)
         # default value indicates either corrupt or removed file.  For corrupt, there
         #      is an error message shown.
-        retval = fn, None, None, None
+        retval = None, None, None, None
 
         if os.path.isfile(tar_path):
             index_cache_path = join(subdir_path, '.cache', 'index', fn + '.json')
@@ -1134,6 +1160,13 @@ class ChannelIndex(object):
         with open(index_cache_path) as fh:
             index_json = json.load(fh)
         return index_json
+
+    def _load_paths_from_cache(self, subdir, fn, stat_cache):
+        paths_cache_path = join(self.channel_root, subdir, '.cache', 'paths', fn + '.json')
+        log.debug("loading paths cache %s" % paths_cache_path)
+        with open(paths_cache_path) as fh:
+            paths_json = json.load(fh)
+        return paths_json
 
     def _load_all_from_cache(self, subdir, fn):
         subdir_path = join(self.channel_root, subdir)
@@ -1432,3 +1465,44 @@ class ChannelIndex(object):
         repodata_json_path = join(self.channel_root, subdir, "repodata2.json")
         new_repodata = json.dumps(repodata2, indent=2, sort_keys=True, separators=(',', ': '))
         return _maybe_write(repodata_json_path, new_repodata, True)
+
+    def _write_file_index(self, subdir, reference_packages):
+        index_file = join(self.channel_root, subdir, "filelist.sqlite3")
+        con = sqlite3.connect(index_file)
+        cur = con.cursor()
+        cur.executescript('''
+drop table if exists packages;
+drop table if exists files;
+create table packages (id, name, version, build_str, filename);
+create table files (pkgid, dirname, files);
+create index dirnames on files (dirname);
+''')
+        pkg_id = 0
+        for info in reference_packages:
+            fn = info['fn']
+            paths = self._load_paths_from_cache(subdir, fn, None)
+            pkg_dirs = {}
+            for path_info in paths.get('paths', []):
+                path = path_info['_path']
+                if path.endswith('.pyc'):
+                    continue
+                path_dir = dirname(path)
+                if path_dir not in pkg_dirs:
+                    pkg_dirs[path_dir] = []
+                path_base = basename(path)
+                pkg_dirs[path_dir].append(path_base)
+
+            cur.execute('insert into packages values(?, ?, ?, ?, ?)', (
+                pkg_id,
+                info['name'],
+                info['version'],
+                info['build'],
+                fn
+            ))
+            cur.executemany('insert into files values(?, ?, ?)', (
+                (pkg_id, path_dir, '/'.join(path_files))
+                for path_dir, path_files in pkg_dirs.items()
+            ))
+            pkg_id += 1
+        con.commit()
+        cur.close()
